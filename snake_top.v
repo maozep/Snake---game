@@ -1,81 +1,471 @@
-// Snake Game - Top Module
+// Snake Game - Top Module (Full Implementation)
 // Hardware: Tang Nano 9K (Gowin GW1NR-9C) + Sipeed 7-inch LCD 800x480
 //
-// System clock: 27 MHz (onboard crystal, פין 52)
-// Pixel clock:  33 MHz (via Gowin rPLL)
-// Color depth:  RGB565 - המחבר הפיזי על Tang Nano 9K: R[4:0] G[5:0] B[4:0]
+// System clock: 27 MHz -> Pixel clock: 33 MHz (Gowin rPLL)
+// Grid:  25 cols x 15 rows  (each cell = 32x32 px)
+//
+// Game states:
+//   ST_IDLE      - title screen "SNAKE" / "PRESS S1", wait for keypress
+//   ST_PLAYING   - active game
+//   ST_GAME_OVER - "GAME OVER" + flash red, press S1 to restart
+//
+// Speed levels (frames per move @ 60 Hz):
+//   Score  0- 4 -> 15 frames  (4.0 moves/sec)
+//   Score  5- 9 -> 12 frames  (5.0 moves/sec)
+//   Score 10-14 ->  9 frames  (6.7 moves/sec)
+//   Score  15+  ->  6 frames  (10  moves/sec)
+//
+// Colors:  Head = bright green  | Body = dark green
+//          Food = red           | Score = white (top-left overlay)
+//          Game-over bg = flash red | Text = white
+//
+// Keypad:  UP=2  DOWN=8  LEFT=4  RIGHT=6  | S1=reset
+//
+// Body storage: circular buffer (MAX_LEN=64 segments)
+// Collision:    flat 375-bit presence map  body_map[row*25+col]
+// Food RNG:     16-bit Galois LFSR
+
+`timescale 1ns/1ps
 
 module snake_top (
-    input  wire        clk,       // 27 MHz (פין 52)
-    input  wire        reset_btn, // כפתור S1 active-low (פין 4)
+    input  wire        clk,         // 27 MHz  (pin 52)
+    input  wire        reset_btn,   // S1 active-low (pin 4)
 
-    // ממשק LCD - שמות תואמים בדיוק את קובץ ה-CST
-    output wire        LCD_CLK,   // פין 35
-    output wire        LCD_HYNC,  // פין 40
-    output wire        LCD_SYNC,  // פין 34
-    output wire        LCD_DEN,   // פין 33
-    output wire [4:0]  LCD_R,     // פינים 75,74,73,72,71
-    output wire [5:0]  LCD_G,     // פינים 70,69,68,57,56,55
-    output wire [4:0]  LCD_B      // פינים 54,53,51,42,41
+    // LCD interface
+    output wire        LCD_CLK,
+    output wire        LCD_HYNC,
+    output wire        LCD_SYNC,
+    output wire        LCD_DEN,
+    output wire [4:0]  LCD_R,
+    output wire [5:0]  LCD_G,
+    output wire [4:0]  LCD_B,
+
+    // Keypad 4x4
+    output wire [3:0]  KEY_ROW,    // pins 66,65,64,63
+    input  wire [3:0]  KEY_COL     // pins 82,81,80,79
 );
-    // --- Reset: כפתור active-low -> reset פנימי active-high ---
+
     wire reset = ~reset_btn;
 
-    // --- PLL: 27 MHz -> 33 MHz ---
-    wire clk_pixel;
-    wire pll_locked;
-
+    wire clk_pixel, pll_locked;
     clock_divider u_pll (
-        .clk_27MHz  (clk),
-        .reset      (reset),
-        .clk_pixel  (clk_pixel),
-        .pll_locked (pll_locked)
+        .clk_27MHz(clk), .reset(reset),
+        .clk_pixel(clk_pixel), .pll_locked(pll_locked)
     );
-
-    // Reset מופעל עד ייצוב PLL
     wire sys_reset = reset | ~pll_locked;
 
-    // --- LCD Controller ---
-    wire        de;
-    wire [9:0]  pixel_x;
-    wire [9:0]  pixel_y;
-
+    wire vsync_int, de;
+    wire [9:0] pixel_x, pixel_y;
     vga_controller u_lcd (
-        .clk_pixel (clk_pixel),
-        .reset     (sys_reset),
-        .hsync     (LCD_HYNC),
-        .vsync     (LCD_SYNC),
-        .de        (de),
-        .pixel_x   (pixel_x),
-        .pixel_y   (pixel_y)
+        .clk_pixel(clk_pixel), .reset(sys_reset),
+        .hsync(LCD_HYNC), .vsync(vsync_int),
+        .de(de), .pixel_x(pixel_x), .pixel_y(pixel_y)
+    );
+    assign LCD_CLK  = clk_pixel;
+    assign LCD_DEN  = de;
+    assign LCD_SYNC = vsync_int;
+
+    wire key_up, key_down, key_left, key_right;
+    keypad_scanner u_keypad (
+        .clk(clk_pixel), .reset(sys_reset),
+        .row(KEY_ROW), .col(KEY_COL),
+        .key_up(key_up), .key_down(key_down),
+        .key_left(key_left), .key_right(key_right)
     );
 
-    assign LCD_CLK = clk_pixel;
-    assign LCD_DEN = de;
-
-    // -------------------------------------------------------
-    //  Snake rendering
-    //  גריד: CELL_SIZE=32 פיקסלים
-    //    800 / 32 = 25 עמודות
-    //    480 / 32 = 15 שורות
-    //  נחש ראשוני: תא מרכזי (12, 7) -> פיקסל (384, 224)
-    //  גודל תא על 7 אינץ: ~7.1 מ"מ
-    // -------------------------------------------------------
+    // =========================================================
+    //  Parameters
+    // =========================================================
     localparam CELL_SIZE = 32;
-    localparam SNAKE_X   = 10'd384;  // 12 * 32
-    localparam SNAKE_Y   = 10'd224;  //  7 * 32
+    localparam GRID_COLS = 25;
+    localparam GRID_ROWS = 15;
     localparam BORDER    = 1;
+    localparam MAX_LEN   = 64;
 
-    wire in_snake = (pixel_x >= SNAKE_X + BORDER) &&
-                    (pixel_x <  SNAKE_X + CELL_SIZE - BORDER) &&
-                    (pixel_y >= SNAKE_Y + BORDER) &&
-                    (pixel_y <  SNAKE_Y + CELL_SIZE - BORDER);
+    localparam DIR_RIGHT = 2'd0;
+    localparam DIR_LEFT  = 2'd1;
+    localparam DIR_UP    = 2'd2;
+    localparam DIR_DOWN  = 2'd3;
 
-    // --- Color output RGB565 ---
-    // לבן: R=11111, G=111111, B=11111
-    // שחור: כל הביטים 0
-    assign LCD_R = (de && in_snake) ? 5'b11111 : 5'b00000;
-    assign LCD_G = (de && in_snake) ? 6'b111111 : 6'b000000;
-    assign LCD_B = (de && in_snake) ? 5'b11111 : 5'b00000;
+    localparam ST_IDLE      = 2'd0;
+    localparam ST_PLAYING   = 2'd1;
+    localparam ST_GAME_OVER = 2'd2;
+
+    // =========================================================
+    //  Cell-index: row*25 + col (0..374)
+    // =========================================================
+    function [8:0] cidx;
+        input [3:0] r;
+        input [4:0] c;
+        cidx = ({5'b0,r} << 4) + ({5'b0,r} << 3) + {5'b0,r} + {4'b0,c};
+    endfunction
+
+    // =========================================================
+    //  Character font  (5x7 pixels, 35-bit bitmap)
+    //  ch 0-9   = digits
+    //  ch 10-35 = letters A-Z
+    //  ch 36    = space
+    // =========================================================
+    function [34:0] char_bitmap;
+        input [5:0] ch;
+        case (ch)
+            6'd0:  char_bitmap = 35'b01110_10001_10001_10001_10001_10001_01110;
+            6'd1:  char_bitmap = 35'b00100_01100_00100_00100_00100_00100_01110;
+            6'd2:  char_bitmap = 35'b01110_10001_00001_00110_01000_10000_11111;
+            6'd3:  char_bitmap = 35'b11110_00001_00001_01110_00001_00001_11110;
+            6'd4:  char_bitmap = 35'b10001_10001_10001_11111_00001_00001_00001;
+            6'd5:  char_bitmap = 35'b11111_10000_10000_11110_00001_00001_11110;
+            6'd6:  char_bitmap = 35'b01110_10000_10000_11110_10001_10001_01110;
+            6'd7:  char_bitmap = 35'b11111_00001_00001_00010_00100_00100_00100;
+            6'd8:  char_bitmap = 35'b01110_10001_10001_01110_10001_10001_01110;
+            6'd9:  char_bitmap = 35'b01110_10001_10001_01111_00001_00001_01110;
+            6'd10: char_bitmap = 35'b01110_10001_10001_11111_10001_10001_10001; // A
+            6'd11: char_bitmap = 35'b11110_10001_10001_11110_10001_10001_11110; // B
+            6'd12: char_bitmap = 35'b01111_10000_10000_10000_10000_10000_01111; // C
+            6'd13: char_bitmap = 35'b11110_10001_10001_10001_10001_10001_11110; // D
+            6'd14: char_bitmap = 35'b11111_10000_10000_11110_10000_10000_11111; // E
+            6'd15: char_bitmap = 35'b11111_10000_10000_11110_10000_10000_10000; // F
+            6'd16: char_bitmap = 35'b01111_10000_10000_10011_10001_10001_01111; // G
+            6'd17: char_bitmap = 35'b10001_10001_10001_11111_10001_10001_10001; // H
+            6'd18: char_bitmap = 35'b01110_00100_00100_00100_00100_00100_01110; // I
+            6'd19: char_bitmap = 35'b00111_00001_00001_00001_10001_10001_01110; // J
+            6'd20: char_bitmap = 35'b10001_10010_10100_11000_10100_10010_10001; // K
+            6'd21: char_bitmap = 35'b10000_10000_10000_10000_10000_10000_11111; // L
+            6'd22: char_bitmap = 35'b10001_11011_10101_10001_10001_10001_10001; // M
+            6'd23: char_bitmap = 35'b10001_11001_10101_10011_10001_10001_10001; // N
+            6'd24: char_bitmap = 35'b01110_10001_10001_10001_10001_10001_01110; // O
+            6'd25: char_bitmap = 35'b11110_10001_10001_11110_10000_10000_10000; // P
+            6'd26: char_bitmap = 35'b01110_10001_10001_10001_10101_10010_01101; // Q
+            6'd27: char_bitmap = 35'b11110_10001_10001_11110_10100_10010_10001; // R
+            6'd28: char_bitmap = 35'b01110_10000_10000_01110_00001_00001_01110; // S
+            6'd29: char_bitmap = 35'b11111_00100_00100_00100_00100_00100_00100; // T
+            6'd30: char_bitmap = 35'b10001_10001_10001_10001_10001_10001_01110; // U
+            6'd31: char_bitmap = 35'b10001_10001_10001_10001_01010_01010_00100; // V
+            6'd32: char_bitmap = 35'b10001_10001_10101_10101_10101_11011_10001; // W
+            6'd33: char_bitmap = 35'b10001_10001_01010_00100_01010_10001_10001; // X
+            6'd34: char_bitmap = 35'b10001_10001_01010_00100_00100_00100_00100; // Y
+            6'd35: char_bitmap = 35'b11111_00001_00010_00100_01000_10000_11111; // Z
+            default: char_bitmap = 35'b0;
+        endcase
+    endfunction
+
+    function [4:0] font_row_bits;
+        input [34:0] bm;
+        input [2:0]  r;
+        case (r)
+            3'd0: font_row_bits = bm[34:30];
+            3'd1: font_row_bits = bm[29:25];
+            3'd2: font_row_bits = bm[24:20];
+            3'd3: font_row_bits = bm[19:15];
+            3'd4: font_row_bits = bm[14:10];
+            3'd5: font_row_bits = bm[9:5];
+            3'd6: font_row_bits = bm[4:0];
+            default: font_row_bits = 5'b0;
+        endcase
+    endfunction
+
+    // Returns 1 if pixel (px,py) hits glyph at cell (cx,cy), scale=2
+    function text_pix;
+        input [9:0] px, py;
+        input [9:0] cx, cy;
+        input [5:0] ch;
+        reg [9:0]  rx, ry;
+        reg [2:0]  fc, fr_v;
+        reg [34:0] bm;
+        reg [4:0]  rbits;
+        begin
+            rx = px - cx;
+            ry = py - cy;
+            if (rx < 10'd10 && ry < 10'd14 && ch != 6'd36) begin
+                fc    = rx[3:1];
+                fr_v  = ry[3:1];
+                bm    = char_bitmap(ch);
+                rbits = font_row_bits(bm, fr_v);
+                text_pix = rbits[4 - fc];
+            end else
+                text_pix = 1'b0;
+        end
+    endfunction
+
+    // =========================================================
+    //  Snake Body Circular Buffer (MAX_LEN=64)
+    // =========================================================
+    reg [4:0] body_col [0:MAX_LEN-1];
+    reg [3:0] body_row [0:MAX_LEN-1];
+    reg [5:0] head_ptr;
+    reg [6:0] snake_len;
+
+    wire [5:0] tail_ptr = head_ptr - snake_len[5:0] + 6'd1;
+    wire [4:0] head_col = body_col[head_ptr];
+    wire [3:0] head_row = body_row[head_ptr];
+
+    // =========================================================
+    //  Body Presence Map (375 bits)
+    // =========================================================
+    reg [374:0] body_map;
+
+    // =========================================================
+    //  Game State
+    // =========================================================
+    reg [1:0]  game_state;
+    reg [1:0]  direction;
+    reg [3:0]  frame_cnt;
+    reg [7:0]  score;
+    reg [4:0]  flash_cnt;
+
+    reg  vsync_d;
+    wire frame_tick = ~vsync_d & vsync_int;
+    wire any_key    = key_up | key_down | key_left | key_right;
+
+    // =========================================================
+    //  Dynamic Speed
+    // =========================================================
+    reg [3:0] move_speed;
+    always @(*) begin
+        if      (score >= 8'd15) move_speed = 4'd6;
+        else if (score >= 8'd10) move_speed = 4'd9;
+        else if (score >= 8'd5)  move_speed = 4'd12;
+        else                     move_speed = 4'd15;
+    end
+
+    // =========================================================
+    //  Food
+    // =========================================================
+    reg [4:0] food_col;
+    reg [3:0] food_row;
+    reg       food_active;
+
+    reg  [15:0] lfsr;
+    wire [15:0] lfsr_next = {1'b0, lfsr[15:1]} ^ (lfsr[0] ? 16'hB400 : 16'h0);
+
+    wire [4:0] fc_col = (lfsr[4:0]  < 5'd25) ? lfsr[4:0]  : lfsr[4:0]  - 5'd25;
+    wire [3:0] fc_row = (lfsr[11:8] < 4'd15) ? lfsr[11:8] : lfsr[11:8] - 4'd15;
+
+    // =========================================================
+    //  Next-Head Position (combinational)
+    // =========================================================
+    reg [4:0] next_col;
+    reg [3:0] next_row;
+    always @(*) begin
+        case (direction)
+            DIR_RIGHT: begin next_col = (head_col==5'd24) ? 5'd0  : head_col+5'd1; next_row = head_row; end
+            DIR_LEFT:  begin next_col = (head_col==5'd0)  ? 5'd24 : head_col-5'd1; next_row = head_row; end
+            DIR_UP:    begin next_col = head_col; next_row = (head_row==4'd0)  ? 4'd14 : head_row-4'd1; end
+            default:   begin next_col = head_col; next_row = (head_row==4'd14) ? 4'd0  : head_row+4'd1; end
+        endcase
+    end
+
+    wire [8:0] next_cidx = cidx(next_row, next_col);
+    wire [8:0] tail_cidx = cidx(body_row[tail_ptr], body_col[tail_ptr]);
+
+    wire eating_food = food_active && (next_col == food_col) && (next_row == food_row);
+    wire hit_body    = body_map[next_cidx] &&
+                       (eating_food || (next_cidx != tail_cidx));
+
+    // =========================================================
+    //  Game Logic (sequential)
+    // =========================================================
+    always @(posedge clk_pixel or posedge sys_reset) begin
+        if (sys_reset) begin
+            vsync_d     <= 1'b1;
+            game_state  <= ST_IDLE;
+            direction   <= DIR_RIGHT;
+            frame_cnt   <= 4'd0;
+            score       <= 8'd0;
+            flash_cnt   <= 5'd0;
+            lfsr        <= 16'hACE1;
+            food_active <= 1'b1;
+            food_col    <= 5'd20;
+            food_row    <= 4'd7;
+
+            head_ptr  <= 6'd0;
+            snake_len <= 7'd3;
+            body_col[0]  <= 5'd12;  body_row[0]  <= 4'd7;
+            body_col[63] <= 5'd11;  body_row[63] <= 4'd7;
+            body_col[62] <= 5'd10;  body_row[62] <= 4'd7;
+
+            body_map      <= 375'b0;
+            body_map[187] <= 1'b1;   // cidx(7,12)
+            body_map[186] <= 1'b1;   // cidx(7,11)
+            body_map[185] <= 1'b1;   // cidx(7,10)
+
+        end else begin
+            lfsr    <= lfsr_next;
+            vsync_d <= vsync_int;
+
+            if (frame_tick) begin
+                flash_cnt <= flash_cnt + 5'd1;
+
+                case (game_state)
+
+                    ST_IDLE: begin
+                        if      (key_up)    direction <= DIR_UP;
+                        else if (key_down)  direction <= DIR_DOWN;
+                        else if (key_left)  direction <= DIR_LEFT;
+                        else if (key_right) direction <= DIR_RIGHT;
+                        if (any_key) game_state <= ST_PLAYING;
+                    end
+
+                    ST_PLAYING: begin
+                        if      (key_up    && direction != DIR_DOWN)  direction <= DIR_UP;
+                        else if (key_down  && direction != DIR_UP)    direction <= DIR_DOWN;
+                        else if (key_left  && direction != DIR_RIGHT) direction <= DIR_LEFT;
+                        else if (key_right && direction != DIR_LEFT)  direction <= DIR_RIGHT;
+
+                        frame_cnt <= frame_cnt + 4'd1;
+                        if (frame_cnt == move_speed - 4'd1) begin
+                            frame_cnt <= 4'd0;
+                            if (hit_body) begin
+                                game_state <= ST_GAME_OVER;
+                            end else begin
+                                head_ptr                  <= head_ptr + 6'd1;
+                                body_col[head_ptr + 6'd1] <= next_col;
+                                body_row[head_ptr + 6'd1] <= next_row;
+                                body_map[next_cidx]       <= 1'b1;
+                                if (eating_food) begin
+                                    snake_len   <= snake_len + 7'd1;
+                                    score       <= score + 8'd1;
+                                    food_active <= 1'b0;
+                                end else begin
+                                    if (tail_cidx != next_cidx)
+                                        body_map[tail_cidx] <= 1'b0;
+                                end
+                            end
+                        end
+
+                        if (!food_active && !body_map[cidx(fc_row, fc_col)]) begin
+                            food_row    <= fc_row;
+                            food_col    <= fc_col;
+                            food_active <= 1'b1;
+                        end
+                    end
+
+                    default: begin
+                        // ST_GAME_OVER: wait for sys_reset (S1)
+                    end
+
+                endcase
+            end
+        end
+    end
+
+    // =========================================================
+    //  Rendering (combinational, per-pixel)
+    // =========================================================
+
+    wire [4:0] cur_col  = pixel_x[9:5];
+    wire [4:0] cur_row5 = pixel_y[9:5];
+    wire [3:0] cur_row  = cur_row5[3:0];
+    wire [8:0] cur_cidx = cidx(cur_row, cur_col);
+
+    wire in_interior = de &&
+        (pixel_x[4:0] >= BORDER) && (pixel_x[4:0] < CELL_SIZE - BORDER) &&
+        (pixel_y[4:0] >= BORDER) && (pixel_y[4:0] < CELL_SIZE - BORDER);
+
+    wire is_head = (cur_col == head_col) && (cur_row == head_row);
+    wire is_body = body_map[cur_cidx] && !is_head;
+    wire is_food = food_active && (cur_col == food_col) && (cur_row == food_row);
+    wire flash_on = flash_cnt[4];
+
+    // --- Score overlay (top-left, PLAYING + GAME_OVER) ---
+    wire [3:0] bcd_h = score / 8'd100;
+    wire [3:0] bcd_t = (score - bcd_h * 8'd100) / 8'd10;
+    wire [3:0] bcd_u =  score - bcd_h * 8'd100 - bcd_t * 8'd10;
+
+    wire [34:0] bm_h = char_bitmap({2'b0, bcd_h});
+    wire [34:0] bm_t = char_bitmap({2'b0, bcd_t});
+    wire [34:0] bm_u = char_bitmap({2'b0, bcd_u});
+
+    wire in_score_y = de && (pixel_y >= 10'd8) && (pixel_y < 10'd22);
+
+    wire [9:0] rel_y  = pixel_y - 10'd8;
+    wire [2:0] fr     = rel_y[3:1];
+
+    wire in_dh = in_score_y && (pixel_x >= 10'd8)  && (pixel_x < 10'd18);
+    wire in_dt = in_score_y && (pixel_x >= 10'd20) && (pixel_x < 10'd30);
+    wire in_du = in_score_y && (pixel_x >= 10'd32) && (pixel_x < 10'd42);
+
+    wire [9:0] rel_xh = pixel_x - 10'd8;
+    wire [9:0] rel_xt = pixel_x - 10'd20;
+    wire [9:0] rel_xu = pixel_x - 10'd32;
+    wire [2:0] fch    = rel_xh[3:1];
+    wire [2:0] fct    = rel_xt[3:1];
+    wire [2:0] fcu    = rel_xu[3:1];
+
+    wire [4:0] row_h = font_row_bits(bm_h, fr);
+    wire [4:0] row_t = font_row_bits(bm_t, fr);
+    wire [4:0] row_u = font_row_bits(bm_u, fr);
+
+    wire score_pixel = (game_state != ST_IDLE) && (
+        (in_dh && row_h[4 - fch]) ||
+        (in_dt && row_t[4 - fct]) ||
+        (in_du && row_u[4 - fcu]));
+
+    // --- Title screen: "SNAKE" y=180, "PRESS S1" y=240 ---
+    // Each char 10px wide x 14px tall (5x7 at scale 2), gap=2px
+    // "SNAKE" 5 chars: width=58px, start_x=371
+    // "PRESS S1" 8 chars: width=94px, start_x=353
+    wire idle_pixel = de && (game_state == ST_IDLE) && (
+        text_pix(pixel_x,pixel_y, 10'd371,10'd180, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd383,10'd180, 6'd23) ||  // N
+        text_pix(pixel_x,pixel_y, 10'd395,10'd180, 6'd10) ||  // A
+        text_pix(pixel_x,pixel_y, 10'd407,10'd180, 6'd20) ||  // K
+        text_pix(pixel_x,pixel_y, 10'd419,10'd180, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd353,10'd240, 6'd25) ||  // P
+        text_pix(pixel_x,pixel_y, 10'd365,10'd240, 6'd27) ||  // R
+        text_pix(pixel_x,pixel_y, 10'd377,10'd240, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd389,10'd240, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd401,10'd240, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd425,10'd240, 6'd28) ||  // S (space at 413)
+        text_pix(pixel_x,pixel_y, 10'd437,10'd240, 6'd1));     // 1
+
+    // --- Game over: "GAME OVER" centered y=220 ---
+    // 9 chars: width=106px, start_x=347
+    wire gameover_pixel = de && (game_state == ST_GAME_OVER) && (
+        text_pix(pixel_x,pixel_y, 10'd347,10'd220, 6'd16) ||  // G
+        text_pix(pixel_x,pixel_y, 10'd359,10'd220, 6'd10) ||  // A
+        text_pix(pixel_x,pixel_y, 10'd371,10'd220, 6'd22) ||  // M
+        text_pix(pixel_x,pixel_y, 10'd383,10'd220, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd407,10'd220, 6'd24) ||  // O (space at 395)
+        text_pix(pixel_x,pixel_y, 10'd419,10'd220, 6'd31) ||  // V
+        text_pix(pixel_x,pixel_y, 10'd431,10'd220, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd443,10'd220, 6'd27));    // R
+
+    // =========================================================
+    //  Pixel color mux
+    //  Priority: text overlay > cell border > state-based color
+    // =========================================================
+    reg [4:0] pix_r;
+    reg [5:0] pix_g;
+    reg [4:0] pix_b;
+
+    always @(*) begin
+        if (score_pixel || idle_pixel || gameover_pixel) begin
+            pix_r = 5'b11111;  pix_g = 6'b111111;  pix_b = 5'b11111;
+        end else if (!in_interior) begin
+            pix_r = 5'b00000;  pix_g = 6'b000000;  pix_b = 5'b00000;
+        end else begin
+            case (game_state)
+                ST_IDLE: begin
+                    pix_r = 5'b00000;  pix_g = 6'b000100;  pix_b = 5'b00110;
+                end
+                ST_PLAYING: begin
+                    if (is_head)      begin pix_r = 5'b00000; pix_g = 6'b111111; pix_b = 5'b00000; end
+                    else if (is_body) begin pix_r = 5'b00000; pix_g = 6'b011000; pix_b = 5'b00000; end
+                    else if (is_food) begin pix_r = 5'b11111; pix_g = 6'b000000; pix_b = 5'b00000; end
+                    else              begin pix_r = 5'b00000; pix_g = 6'b000000; pix_b = 5'b00000; end
+                end
+                default: begin  // ST_GAME_OVER
+                    pix_r = flash_on ? 5'b11111 : 5'b00110;
+                    pix_g = 6'b000000;
+                    pix_b = 5'b00000;
+                end
+            endcase
+        end
+    end
+
+    assign LCD_R = pix_r;
+    assign LCD_G = pix_g;
+    assign LCD_B = pix_b;
 
 endmodule
