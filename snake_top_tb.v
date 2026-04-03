@@ -4,9 +4,10 @@
 // Phase 2 - ST_PLAYING:    head green, food red, score white, no bad pixels
 // Phase 3 - Movement:      head position changes after one forced game move
 // Phase 4 - U-turn block:  pressing opposite direction does not reverse snake
-// Phase 5 - Game Over:     hit_body=1 -> transitions to ST_GAME_OVER
-// Phase 6 - GO visuals:    red/dark-red background + GAME OVER text, no green
-// Phase 7 - Reset:         S1 returns to ST_IDLE, title visible
+// Phase 5 - Pause/Resume:  key "5" toggles paused, freezes and resumes movement
+// Phase 6 - Game Over:     hit_body=1 -> transitions to ST_GAME_OVER
+// Phase 7 - GO visuals:    red/dark-red background + GAME OVER text, no green
+// Phase 8 - Reset:         S1 returns to ST_IDLE, title visible
 //
 // Acceleration technique (Phases 3, 4):
 //   Instead of waiting 15 frames for a game move, force dut.frame_cnt = 14
@@ -25,7 +26,7 @@ module snake_top_tb;
     reg reset_btn = 0;
     reg [3:0] KEY_COL = 4'b0000;
 
-    wire        LCD_CLK, LCD_HYNC, LCD_SYNC, LCD_DEN;
+    wire        LCD_CLK, LCD_HSYNC, LCD_VSYNC, LCD_DEN;
     wire [4:0]  LCD_R;
     wire [5:0]  LCD_G;
     wire [4:0]  LCD_B;
@@ -33,7 +34,7 @@ module snake_top_tb;
 
     snake_top dut (
         .clk(clk), .reset_btn(reset_btn),
-        .LCD_CLK(LCD_CLK), .LCD_HYNC(LCD_HYNC), .LCD_SYNC(LCD_SYNC),
+        .LCD_CLK(LCD_CLK), .LCD_HSYNC(LCD_HSYNC), .LCD_VSYNC(LCD_VSYNC),
         .LCD_DEN(LCD_DEN), .LCD_R(LCD_R), .LCD_G(LCD_G), .LCD_B(LCD_B),
         .KEY_ROW(KEY_ROW), .KEY_COL(KEY_COL)
     );
@@ -47,7 +48,7 @@ module snake_top_tb;
     integer anyred_pixels = 0;   // any red-only: R>0 G=0 B=0  (covers dark flash too)
     integer bad_pixels    = 0;
 
-    always @(negedge LCD_SYNC) vsync_count = vsync_count + 1;
+    always @(negedge LCD_VSYNC) vsync_count = vsync_count + 1;
 
     always @(posedge LCD_CLK) begin
         if (LCD_DEN && LCD_R==5'b11111 && LCD_G==6'b111111 && LCD_B==5'b11111)
@@ -203,10 +204,62 @@ module snake_top_tb;
                 $display("FAIL: U-turn NOT blocked (row %0d -> %0d)", pre_row4, dut.head_row);
         end
 
-        // ---- Phase 5: Self-collision -> Game Over ----
+        // ---- Phase 5: Pause/Resume (key 5) ----
+        $display("--- Phase 5: Pause/Resume (key 5) ---");
+        begin : phase5
+            reg [4:0] pre_col5;
+            reg [3:0] pre_row5;
+            reg [4:0] paused_col5;
+            reg [3:0] paused_row5;
+
+            // Toggle pause ON
+            force dut.key_pause = 1'b1;
+            @(posedge dut.frame_tick);
+            #1;
+            release dut.key_pause;
+
+            if (dut.paused)
+                $display("PASS: Pause toggled ON");
+            else
+                $display("FAIL: Pause did not toggle ON");
+
+            // Verify snake is frozen while paused
+            pre_col5 = dut.head_col;
+            pre_row5 = dut.head_row;
+            #(2 * ONE_FRAME);
+            paused_col5 = dut.head_col;
+            paused_row5 = dut.head_row;
+            if (paused_col5 == pre_col5 && paused_row5 == pre_row5)
+                $display("PASS: Snake frozen during pause");
+            else
+                $display("FAIL: Snake moved during pause (%0d,%0d)->(%0d,%0d)",
+                         pre_col5, pre_row5, paused_col5, paused_row5);
+
+            // Toggle pause OFF
+            force dut.key_pause = 1'b1;
+            @(posedge dut.frame_tick);
+            #1;
+            release dut.key_pause;
+
+            if (!dut.paused)
+                $display("PASS: Pause toggled OFF (resume)");
+            else
+                $display("FAIL: Pause did not toggle OFF");
+
+            // Verify movement resumes
+            pre_col5 = dut.head_col;
+            pre_row5 = dut.head_row;
+            force_one_move;
+            if (dut.head_col != pre_col5 || dut.head_row != pre_row5)
+                $display("PASS: Snake moves after resume");
+            else
+                $display("FAIL: Snake still frozen after resume");
+        end
+
+        // ---- Phase 6: Self-collision -> Game Over ----
         // hit_body is only evaluated when frame_tick AND frame_cnt==move_speed-1.
         // Force both so the collision check fires on the very next frame_tick.
-        $display("--- Phase 5: Self-collision -> Game Over ---");
+        $display("--- Phase 6: Self-collision -> Game Over ---");
         force dut.hit_body  = 1'b1;
         force dut.frame_cnt = 4'd14;
         @(posedge dut.frame_tick);
@@ -219,12 +272,12 @@ module snake_top_tb;
         else
             $display("FAIL: game_state=%0d (expected 2=ST_GAME_OVER)", dut.game_state);
 
-        // ---- Phase 6: Game Over visuals ----
+        // ---- Phase 7: Game Over visuals ----
         // anyred_pixels covers both flash states (bright R=11111 and dark R=00110).
         // Expect: anyred > 0, GAME OVER text (white > 0), no green, no bad pixels.
         reset_counters;
         #(2 * ONE_FRAME);
-        $display("--- Phase 6: Game Over visuals ---");
+        $display("--- Phase 7: Game Over visuals ---");
         $display("AnyRed : %0d (expect >0 flash bg)", anyred_pixels);
         $display("White  : %0d (expect >0 GAME OVER text)", white_pixels);
         $display("Green  : %0d (expect 0)", green_pixels);
@@ -250,8 +303,8 @@ module snake_top_tb;
         else
             $display("FAIL: %0d pixels outside DE in Game Over", bad_pixels);
 
-        // ---- Phase 7: Reset from Game Over -> ST_IDLE ----
-        $display("--- Phase 7: Reset from Game Over ---");
+        // ---- Phase 8: Reset from Game Over -> ST_IDLE ----
+        $display("--- Phase 8: Reset from Game Over ---");
         reset_btn = 1'b0;  // S1 active-low: assert reset
         #200;
         reset_btn = 1'b1;

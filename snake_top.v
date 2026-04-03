@@ -19,7 +19,7 @@
 //          Food = red           | Score = white (top-left overlay)
 //          Game-over bg = flash red | Text = white
 //
-// Keypad:  UP=2  DOWN=8  LEFT=4  RIGHT=6  | S1=reset
+// Keypad:  UP=2  DOWN=8  LEFT=4  RIGHT=6  PAUSE=5 | S1=reset
 //
 // Body storage: circular buffer (MAX_LEN=64 segments)
 // Collision:    flat 375-bit presence map  body_map[row*25+col]
@@ -33,8 +33,8 @@ module snake_top (
 
     // LCD interface
     output wire        LCD_CLK,
-    output wire        LCD_HYNC,
-    output wire        LCD_SYNC,
+    output wire        LCD_HSYNC,
+    output wire        LCD_VSYNC,
     output wire        LCD_DEN,
     output wire [4:0]  LCD_R,
     output wire [5:0]  LCD_G,
@@ -58,19 +58,20 @@ module snake_top (
     wire [9:0] pixel_x, pixel_y;
     vga_controller u_lcd (
         .clk_pixel(clk_pixel), .reset(sys_reset),
-        .hsync(LCD_HYNC), .vsync(vsync_int),
+        .hsync(LCD_HSYNC), .vsync(vsync_int),
         .de(de), .pixel_x(pixel_x), .pixel_y(pixel_y)
     );
     assign LCD_CLK  = clk_pixel;
     assign LCD_DEN  = de;
-    assign LCD_SYNC = vsync_int;
+    assign LCD_VSYNC = vsync_int;
 
-    wire key_up, key_down, key_left, key_right;
+    wire key_up, key_down, key_left, key_right, key_pause;
     keypad_scanner u_keypad (
         .clk(clk_pixel), .reset(sys_reset),
         .row(KEY_ROW), .col(KEY_COL),
         .key_up(key_up), .key_down(key_down),
-        .key_left(key_left), .key_right(key_right)
+        .key_left(key_left), .key_right(key_right),
+        .key_pause(key_pause)
     );
 
     // =========================================================
@@ -212,10 +213,13 @@ module snake_top (
     reg [3:0]  frame_cnt;
     reg [7:0]  score;
     reg [4:0]  flash_cnt;
+    reg        paused;
+    reg        key_pause_prev;
 
     reg  vsync_d;
     wire frame_tick = ~vsync_d & vsync_int;
     wire any_key    = key_up | key_down | key_left | key_right;
+    wire pause_pressed = key_pause & ~key_pause_prev;
 
     // =========================================================
     //  Dynamic Speed
@@ -273,6 +277,8 @@ module snake_top (
             frame_cnt   <= 4'd0;
             score       <= 8'd0;
             flash_cnt   <= 5'd0;
+            paused      <= 1'b0;
+            key_pause_prev <= 1'b0;
             lfsr        <= 16'hACE1;
             food_active <= 1'b1;
             food_col    <= 5'd20;
@@ -295,10 +301,12 @@ module snake_top (
 
             if (frame_tick) begin
                 flash_cnt <= flash_cnt + 5'd1;
+                key_pause_prev <= key_pause;
 
                 case (game_state)
 
                     ST_IDLE: begin
+                        paused <= 1'b0;
                         if      (key_up)    direction <= DIR_UP;
                         else if (key_down)  direction <= DIR_DOWN;
                         else if (key_left)  direction <= DIR_LEFT;
@@ -307,36 +315,42 @@ module snake_top (
                     end
 
                     ST_PLAYING: begin
-                        if      (key_up    && direction != DIR_DOWN)  direction <= DIR_UP;
-                        else if (key_down  && direction != DIR_UP)    direction <= DIR_DOWN;
-                        else if (key_left  && direction != DIR_RIGHT) direction <= DIR_LEFT;
-                        else if (key_right && direction != DIR_LEFT)  direction <= DIR_RIGHT;
+                        if (pause_pressed)
+                            paused <= ~paused;
 
-                        frame_cnt <= frame_cnt + 4'd1;
-                        if (frame_cnt == move_speed - 4'd1) begin
-                            frame_cnt <= 4'd0;
-                            if (hit_body) begin
-                                game_state <= ST_GAME_OVER;
-                            end else begin
-                                head_ptr                  <= head_ptr + 6'd1;
-                                body_col[head_ptr + 6'd1] <= next_col;
-                                body_row[head_ptr + 6'd1] <= next_row;
-                                body_map[next_cidx]       <= 1'b1;
-                                if (eating_food) begin
-                                    snake_len   <= snake_len + 7'd1;
-                                    score       <= score + 8'd1;
-                                    food_active <= 1'b0;
+                        if (!paused && !pause_pressed) begin
+                            if      (key_up    && direction != DIR_DOWN)  direction <= DIR_UP;
+                            else if (key_down  && direction != DIR_UP)    direction <= DIR_DOWN;
+                            else if (key_left  && direction != DIR_RIGHT) direction <= DIR_LEFT;
+                            else if (key_right && direction != DIR_LEFT)  direction <= DIR_RIGHT;
+
+                            frame_cnt <= frame_cnt + 4'd1;
+                            if (frame_cnt == move_speed - 4'd1) begin
+                                frame_cnt <= 4'd0;
+                                if (hit_body) begin
+                                    game_state <= ST_GAME_OVER;
+                                    paused <= 1'b0;
                                 end else begin
-                                    if (tail_cidx != next_cidx)
-                                        body_map[tail_cidx] <= 1'b0;
+                                    head_ptr                  <= head_ptr + 6'd1;
+                                    body_col[head_ptr + 6'd1] <= next_col;
+                                    body_row[head_ptr + 6'd1] <= next_row;
+                                    body_map[next_cidx]       <= 1'b1;
+                                    if (eating_food) begin
+                                        snake_len   <= snake_len + 7'd1;
+                                        score       <= score + 8'd1;
+                                        food_active <= 1'b0;
+                                    end else begin
+                                        if (tail_cidx != next_cidx)
+                                            body_map[tail_cidx] <= 1'b0;
+                                    end
                                 end
                             end
-                        end
 
-                        if (!food_active && !body_map[cidx(fc_row, fc_col)]) begin
-                            food_row    <= fc_row;
-                            food_col    <= fc_col;
-                            food_active <= 1'b1;
+                            if (!food_active && !body_map[cidx(fc_row, fc_col)]) begin
+                                food_row    <= fc_row;
+                                food_col    <= fc_col;
+                                food_active <= 1'b1;
+                            end
                         end
                     end
 
@@ -431,6 +445,14 @@ module snake_top (
         text_pix(pixel_x,pixel_y, 10'd431,10'd220, 6'd14) ||  // E
         text_pix(pixel_x,pixel_y, 10'd443,10'd220, 6'd27));    // R
 
+    // --- Pause overlay: "PAUSE" centered y=220 ---
+    wire pause_pixel = de && (game_state == ST_PLAYING) && paused && (
+        text_pix(pixel_x,pixel_y, 10'd371,10'd220, 6'd25) ||  // P
+        text_pix(pixel_x,pixel_y, 10'd383,10'd220, 6'd10) ||  // A
+        text_pix(pixel_x,pixel_y, 10'd395,10'd220, 6'd30) ||  // U
+        text_pix(pixel_x,pixel_y, 10'd407,10'd220, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd419,10'd220, 6'd14));   // E
+
     // =========================================================
     //  Pixel color mux
     //  Priority: text overlay > cell border > state-based color
@@ -440,7 +462,7 @@ module snake_top (
     reg [4:0] pix_b;
 
     always @(*) begin
-        if (score_pixel || idle_pixel || gameover_pixel) begin
+        if (score_pixel || idle_pixel || gameover_pixel || pause_pixel) begin
             pix_r = 5'b11111;  pix_g = 6'b111111;  pix_b = 5'b11111;
         end else if (!in_interior) begin
             pix_r = 5'b00000;  pix_g = 6'b000000;  pix_b = 5'b00000;

@@ -20,15 +20,15 @@ Classic Snake game implemented entirely in Verilog, running on a **Gowin GW1NR-9
 |---|---|---|
 | System clock | 52 | In |
 | Reset (S1, active-low) | 4 | In |
-| LCD_CLK | 33 | Out |
-| LCD_HSYNC | 34 | Out |
-| LCD_VSYNC | 35 | Out |
-| LCD_DE | 40 | Out |
-| LCD_R[4:0] | 41-45 | Out |
-| LCD_G[5:0] | 46-51 | Out |
-| LCD_B[4:0] | 53-57 | Out |
-| KEY_ROW[3:0] | 63-66 | Out |
-| KEY_COL[3:0] | 79-82 | In (PULL_DOWN) |
+| LCD_CLK | 35 | Out |
+| LCD_HSYNC | 40 | Out |
+| LCD_VSYNC | 34 | Out |
+| LCD_DEN | 33 | Out |
+| LCD_R[4:0] | 71, 72, 73, 74, 75 | Out |
+| LCD_G[5:0] | 55, 56, 57, 68, 69, 70 | Out |
+| LCD_B[4:0] | 41, 42, 51, 53, 54 | Out |
+| KEY_ROW[3:0] | 66, 65, 64, 63 | Out |
+| KEY_COL[3:0] | 82, 81, 80, 79 | In (PULL_DOWN) |
 
 ---
 
@@ -38,7 +38,7 @@ Classic Snake game implemented entirely in Verilog, running on a **Gowin GW1NR-9
 Keypad layout:
        COL0  COL1  COL2  COL3
 ROW0:   1     2     3     A       2 = UP
-ROW1:   4     5     6     B       4 = LEFT    6 = RIGHT
+ROW1:   4     5     6     B       4 = LEFT    5 = PAUSE    6 = RIGHT
 ROW2:   7     8     9     C       8 = DOWN
 ROW3:   *     0     #     D
 ```
@@ -49,6 +49,7 @@ ROW3:   *     0     #     D
 | **8** | Move down |
 | **4** | Move left |
 | **6** | Move right |
+| **5** | Pause / Resume |
 | **S1 (reset)** | Restart game |
 
 180 U-turns are blocked (you cannot reverse into yourself in a single move).

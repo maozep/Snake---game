@@ -11,6 +11,7 @@
 // Snake direction mapping:
 //   UP    = key "2" -> ROW[0], COL[1]
 //   LEFT  = key "4" -> ROW[1], COL[0]
+//   PAUSE = key "5" -> ROW[1], COL[1]
 //   RIGHT = key "6" -> ROW[1], COL[2]
 //   DOWN  = key "8" -> ROW[2], COL[1]
 //
@@ -29,7 +30,8 @@ module keypad_scanner (
     output reg        key_up,
     output reg        key_down,
     output reg        key_left,
-    output reg        key_right
+    output reg        key_right,
+    output reg        key_pause
 );
     // 33 MHz / 2^15 = ~1007 Hz per row  ->  ~252 Hz full scan
     reg [14:0] scan_timer;
@@ -80,11 +82,13 @@ module keypad_scanner (
             key_down  <= 1'b0;
             key_left  <= 1'b0;
             key_right <= 1'b0;
+            key_pause <= 1'b0;
         end else begin
             key_up    <= col_r0[1];  // ROW0, COL1 = "2"
             key_down  <= col_r2[1];  // ROW2, COL1 = "8"
             key_left  <= col_r1[0];  // ROW1, COL0 = "4"
             key_right <= col_r1[2];  // ROW1, COL2 = "6"
+            key_pause <= col_r1[1];  // ROW1, COL1 = "5"
         end
     end
 
